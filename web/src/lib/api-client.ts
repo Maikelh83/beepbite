@@ -513,6 +513,16 @@ export function parentSelectColumns(table: string, select: string): string {
   return extras.length ? `${parsed.base},${extras.join(',')}` : parsed.base;
 }
 
+// The follow-up query has to return the column the embed is joined on.
+// A one-embed joins child.id; a many-embed groups on the child's FK.
+// Callers list display columns (`name, rate`) and omit that key.
+export function embedSelectColumns(cols: string, required: string): string {
+  if (!cols || cols === '*') return cols || '*';
+  const have = new Set(cols.split(',').map((s) => s.trim()).filter(Boolean));
+  if (have.has(required)) return cols;
+  return `${cols},${required}`;
+}
+
 // Rows are opaque records keyed by column name — the shape varies by table
 // and is not modeled here (mirrors the untyped rows the old supabase-js
 // client returned).
@@ -532,7 +542,8 @@ async function resolveEmbeds(parentTable: string, rows: Row[], joins: Join[]): P
       if (!ids.length) { for (const r of rows) r[j.name] = null; continue; }
       const qs = new URLSearchParams();
       qs.append('in', ['id', ...ids].join(','));
-      if (j.cols && j.cols !== '*') qs.set('select', j.cols);
+      const select = embedSelectColumns(j.cols, 'id');
+      if (select && select !== '*') qs.set('select', select);
       const res = await request<Row[]>('GET', `/data/${edge.table}?${qs.toString()}`);
       const byId = new Map((res.data || []).map(r => [r.id, r]));
       for (const r of rows) r[j.name] = byId.get(r[edge.col]) || null;
@@ -541,7 +552,8 @@ async function resolveEmbeds(parentTable: string, rows: Row[], joins: Join[]): P
       if (!ids.length) { for (const r of rows) r[j.name] = []; continue; }
       const qs = new URLSearchParams();
       qs.append('in', [edge.col, ...ids].join(','));
-      if (j.cols && j.cols !== '*') qs.set('select', j.cols);
+      const select = embedSelectColumns(j.cols, edge.col);
+      if (select && select !== '*') qs.set('select', select);
       const res = await request<Row[]>('GET', `/data/${edge.table}?${qs.toString()}`);
       const grouped = new Map<unknown, Row[]>();
       for (const child of res.data || []) {

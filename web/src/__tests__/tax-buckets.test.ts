@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parentSelectColumns } from '../lib/api-client';
+import { embedSelectColumns, parentSelectColumns } from '../lib/api-client';
 import { splitTax } from '../lib/tax-buckets';
 
 describe('splitTax', () => {
@@ -36,5 +36,10 @@ describe('parentSelectColumns', () => {
     `);
     expect(cols.split(',')).toContain('tax_rate_id');
     expect(cols.split(',')).toContain('category_id');
+  });
+
+  it('asks the tax-rate lookup for id so the row can be attached', () => {
+    expect(embedSelectColumns('name,rate,is_inclusive', 'id')).toBe('name,rate,is_inclusive,id');
+    expect(embedSelectColumns('id,name', 'id')).toBe('id,name');
   });
 });
