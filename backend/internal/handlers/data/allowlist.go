@@ -35,6 +35,7 @@ var allTables = map[string]ops{
 	"orders":                   {Select: true, Insert: true, Update: true},
 	"order_payments":           {Select: true, Insert: true, Update: true},
 	"order_items":              {Select: true, Insert: true, Update: true},
+	"order_tax_lines":          {Select: true},
 	"order_item_modifiers":     {Select: true, Insert: true},
 	"driver_ratings":           {Select: true, Insert: true},
 	"driver_earnings":          {Select: true, Insert: true, Update: true},

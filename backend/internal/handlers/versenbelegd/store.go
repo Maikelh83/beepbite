@@ -11,6 +11,7 @@ import (
 	"github.com/beepbite/backend/internal/channel"
 	intake "github.com/beepbite/backend/internal/channel/versenbelegd"
 	"github.com/beepbite/backend/internal/db"
+	"github.com/beepbite/backend/internal/linetax"
 	"github.com/beepbite/backend/internal/money"
 	"github.com/beepbite/backend/internal/tax"
 	"github.com/jackc/pgx/v5"
@@ -96,7 +97,8 @@ func (s *Store) Accept(ctx context.Context, locationSlug string, order channel.I
 			result.Replayed = true
 			result.PaymentMode = order.Payment.Mode
 			result.Kitchen = "queued"
-			return nil
+			result.TaxLines, result.TaxCents, err = loadTaxLines(ctx, tx, result.OrderID)
+			return err
 		}
 
 		lines, warnings, err := resolveLines(ctx, tx, loc.id, loc.decimals, order.Lines, skuMap)
@@ -105,20 +107,24 @@ func (s *Store) Accept(ctx context.Context, locationSlug string, order channel.I
 		}
 
 		var subtotal int64
-		for _, ln := range lines {
-			subtotal += ln.unit * int64(ln.qty)
+		priced := make([]linetax.PricedLine, len(lines))
+		for i, ln := range lines {
+			amount := ln.unit * int64(ln.qty)
+			subtotal += amount
+			priced[i] = linetax.PricedLine{ItemID: ln.itemID, Amount: amount}
 		}
 
-		cfg, err := taxConfig(ctx, tx, loc)
+		// SKUs with no item rate use the location default, which is what this
+		// path charged on the whole order before per-item rates existed.
+		split, err := linetax.Price(ctx, tx, loc.id, priced)
 		if err != nil {
 			return err
 		}
-		taxed := cfg.Compute(subtotal)
 		fee, err := deliveryFeeCents(loc, order.Fulfillment.Type, subtotal)
 		if err != nil {
 			return err
 		}
-		total := taxed.Gross + fee
+		total := split.Gross + fee
 
 		var accountID string
 		if order.Payment.Mode == "on_account" {
@@ -162,7 +168,7 @@ func (s *Store) Accept(ctx context.Context, locationSlug string, order channel.I
 				organization_id, location_id, customer_id, order_number,
 				order_type, fulfillment_type, status,
 				subtotal_cents, delivery_fee_cents, tax_cents, total_cents,
-				tax_rate, tax_inclusive, currency_code,
+				tax_rate, tax_inclusive, tax_mixed, currency_code,
 				delivery_address, delivery_instructions,
 				business_date, idempotency_key,
 				notes, kitchen_notes, customer_note,
@@ -171,17 +177,17 @@ func (s *Store) Accept(ctx context.Context, locationSlug string, order channel.I
 				$1, $2, $3, $4,
 				$5, $6, 'confirmed',
 				$7, $8, $9, $10,
-				$11, $12, $13,
-				$14, $15,
-				$16::date, $17,
-				$18, $19, $20,
-				$21, $22
+				$11, $12, $13, $14,
+				$15, $16,
+				$17::date, $18,
+				$19, $20, $21,
+				$22, $23
 			) RETURNING id::text
 		`,
 			loc.orgID, loc.id, customerID, number,
 			orderType(order.Fulfillment.Type), order.Fulfillment.Type,
-			subtotal, fee, taxed.Tax, total,
-			cfg.Rate.Percent(), cfg.Inclusive, loc.currency,
+			subtotal, fee, split.Tax, total,
+			split.HeaderRate, split.HeaderInclusive, split.Mixed, loc.currency,
 			deliveryAddr, deliveryInstr,
 			businessDate, key,
 			internalNotes(order, warnings), kitchenNotes(order, zone), nullIfEmpty(customerNote(order)),
@@ -194,14 +200,20 @@ func (s *Store) Accept(ctx context.Context, locationSlug string, order channel.I
 			return fmt.Errorf("insert order: %w", err)
 		}
 
-		for _, ln := range lines {
+		for i, ln := range lines {
+			rated := split.Lines[i]
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO order_items (
-					order_id, item_id, quantity, unit_price_cents, total_price_cents, special_instructions
-				) VALUES ($1, $2, $3, $4, $5, $6)
-			`, orderID, ln.itemID, ln.qty, ln.unit, ln.unit*int64(ln.qty), nullIfEmpty(ln.notes)); err != nil {
+					order_id, item_id, quantity, unit_price_cents, total_price_cents, special_instructions,
+					tax_rate, tax_inclusive, tax_label, net_cents, tax_cents
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			`, orderID, ln.itemID, ln.qty, ln.unit, ln.unit*int64(ln.qty), nullIfEmpty(ln.notes),
+				rated.Percent, rated.Inclusive, rated.Label, rated.Net, rated.Tax); err != nil {
 				return fmt.Errorf("insert order item: %w", err)
 			}
+		}
+		if err := linetax.ReplaceLines(ctx, tx, orderID, split.Buckets); err != nil {
+			return err
 		}
 
 		if err := recordPayment(ctx, tx, order, orderID, customerID, accountID, total); err != nil {
@@ -213,6 +225,8 @@ func (s *Store) Accept(ctx context.Context, locationSlug string, order channel.I
 			OrderNumber:   number,
 			Status:        "confirmed",
 			TotalCents:    total,
+			TaxCents:      split.Tax,
+			TaxLines:      split.Buckets,
 			Currency:      loc.currency,
 			PaymentMode:   order.Payment.Mode,
 			PriceWarnings: warnings,
@@ -346,34 +360,28 @@ func resolveLines(ctx context.Context, tx pgx.Tx, locationID string, decimals in
 	return out, warnings, nil
 }
 
-func taxConfig(ctx context.Context, tx pgx.Tx, loc location) (tax.Config, error) {
-	var (
-		rate      float64
-		inclusive bool
-		label     *string
-	)
-	err := tx.QueryRow(ctx, `
-		SELECT CAST(rate AS float8), is_inclusive, name
-		FROM tax_rates
-		WHERE location_id = $1 AND is_active = true
-		ORDER BY created_at
-		LIMIT 1
-	`, loc.id).Scan(&rate, &inclusive, &label)
-	if err == nil {
-		cfg := tax.Config{Rate: tax.RateFromPercent(rate), Inclusive: inclusive}
-		if label != nil {
-			cfg.Label = *label
+func loadTaxLines(ctx context.Context, tx pgx.Tx, orderID string) ([]tax.BreakdownLine, int64, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT tax_label, CAST(tax_rate AS float8), tax_inclusive, net_cents, tax_cents, gross_cents
+		FROM order_tax_lines
+		WHERE order_id = $1
+		ORDER BY tax_rate, tax_label
+	`, orderID)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var lines []tax.BreakdownLine
+	var taxSum int64
+	for rows.Next() {
+		var ln tax.BreakdownLine
+		if err := rows.Scan(&ln.Label, &ln.Rate, &ln.Inclusive, &ln.NetCents, &ln.TaxCents, &ln.GrossCents); err != nil {
+			return nil, 0, err
 		}
-		return cfg, nil
+		taxSum += ln.TaxCents
+		lines = append(lines, ln)
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return tax.Config{}, err
-	}
-	return tax.Config{
-		Rate:      tax.RateFromPercent(loc.taxRate),
-		Inclusive: loc.taxInclusive,
-		Label:     loc.taxLabel,
-	}, nil
+	return lines, taxSum, rows.Err()
 }
 
 func deliveryFeeCents(loc location, fulfillment string, subtotal int64) (int64, error) {

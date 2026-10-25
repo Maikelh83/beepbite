@@ -19,6 +19,8 @@ import (
 
 	"github.com/beepbite/backend/internal/channel"
 	intake "github.com/beepbite/backend/internal/channel/versenbelegd"
+	"github.com/beepbite/backend/internal/linetax"
+	"github.com/beepbite/backend/internal/tax"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -45,14 +47,16 @@ func (c Config) enabled() (bool, string) {
 // figure, computed from the menu and the location's tax, not the total the
 // site sent (the site does not send a total; line prices are advisory).
 type Result struct {
-	OrderID       string   `json:"order_id"`
-	OrderNumber   string   `json:"order_number"`
-	Status        string   `json:"status"`
-	Replayed      bool     `json:"replayed"`
-	TotalCents    int64    `json:"total_cents"`
-	Currency      string   `json:"currency"`
-	PaymentMode   string   `json:"payment_mode"`
-	PriceWarnings []string `json:"price_warnings,omitempty"`
+	OrderID       string              `json:"order_id"`
+	OrderNumber   string              `json:"order_number"`
+	Status        string              `json:"status"`
+	Replayed      bool                `json:"replayed"`
+	TotalCents    int64               `json:"total_cents"`
+	TaxCents      int64               `json:"tax_cents"`
+	TaxLines      []tax.BreakdownLine `json:"tax_lines,omitempty"`
+	Currency      string              `json:"currency"`
+	PaymentMode   string              `json:"payment_mode"`
+	PriceWarnings []string            `json:"price_warnings,omitempty"`
 	// Kitchen is "queued": the row is confirmed, which enqueues KDS fan-out.
 	// The ticket itself appears on the next pass of the fan-out worker
 	// (about five seconds) and only for items that route to a station.
@@ -164,6 +168,8 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusUnprocessableEntity, "house account credit limit would be exceeded")
 		case errors.Is(accErr, ErrCurrencyMismatch):
 			writeErr(w, http.StatusUnprocessableEntity, "house account currency does not match the location")
+		case errors.Is(accErr, linetax.ErrUnavailable):
+			writeErr(w, http.StatusUnprocessableEntity, "an item's tax rate is inactive or not on this location")
 		default:
 			log.Printf("vers-en-belegd: accept %s: %v", order.ExternalID, accErr)
 			writeErr(w, http.StatusInternalServerError, "internal error")

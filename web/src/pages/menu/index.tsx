@@ -46,7 +46,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { useAuth } from '@/context/auth-context';
-import { useMoney } from '@/context/locale-context';
+import { useLocale, useMoney } from '@/context/locale-context';
 import { useToast } from '@/hooks/use-toast';
 import { supabase } from '@/services/supabase-client';
 import { cn } from "@/lib/utils";
@@ -91,8 +91,16 @@ interface Item {
   auto_calculate_cost: boolean;
   is_recipe_ingredient: boolean;
   is_86ed?: boolean;
+  tax_rate_id?: string | null;
   categories?: MenuCategoryRow | null;
   [key: string]: unknown;
+}
+
+interface TaxRateOption {
+  id: string;
+  name: string;
+  rate: number | string;
+  is_inclusive?: boolean;
 }
 
 interface RecipeComponentRow {
@@ -126,15 +134,18 @@ interface MenuFormData {
   recipe_type: string;
   auto_calculate_cost: boolean;
   is_recipe_ingredient: boolean;
+  tax_rate_id: string;
 }
 
 const Menu = () => {
   const { activeLocation } = useAuth();
   const { format: formatMoneyValue, scale: currencyScaleValue } = useMoney();
+  const { taxLabel } = useLocale();
   const { toast } = useToast();
   const navigate = useNavigate();
   const [items, setItems] = useState<Item[]>([]);
   const [categories, setCategories] = useState<MenuCategoryRow[]>([]);
+  const [taxRates, setTaxRates] = useState<TaxRateOption[]>([]);
   const [recipes, setRecipes] = useState<Item[]>([]);
   const [recipeBreakdown, setRecipeBreakdown] = useState<Record<string, unknown>[]>([]);
   const [loading, setLoading] = useState(true);
@@ -177,7 +188,8 @@ const Menu = () => {
     low_stock_threshold: 5,
     recipe_type: 'simple',
     auto_calculate_cost: false,
-    is_recipe_ingredient: false
+    is_recipe_ingredient: false,
+    tax_rate_id: '',
   });
 
   // Recipe builder data
@@ -207,6 +219,7 @@ const Menu = () => {
       await Promise.all([
         fetchItems(),
         fetchCategories(),
+        fetchTaxRates(),
         fetchRecipeBreakdown()
       ]);
     } catch (error) {
@@ -340,8 +353,24 @@ const Menu = () => {
       low_stock_threshold: 5,
       recipe_type: 'simple',
       auto_calculate_cost: false,
-      is_recipe_ingredient: false
+      is_recipe_ingredient: false,
+      tax_rate_id: '',
     });
+  };
+
+  const fetchTaxRates = async () => {
+    if (!activeLocation) return;
+    const { data, error } = await supabase
+      .from('tax_rates')
+      .select('id, name, rate, is_inclusive')
+      .eq('location_id', activeLocation.id)
+      .eq('is_active', true)
+      .order('rate', { ascending: true });
+    if (error) {
+      console.error('Error fetching tax rates:', error);
+      return;
+    }
+    setTaxRates((data || []) as TaxRateOption[]);
   };
 
   // Inline category creation from the add/edit item modal, so an empty menu
@@ -391,7 +420,8 @@ const Menu = () => {
         low_stock_threshold: formData.track_inventory ? parseInt(String(formData.low_stock_threshold)) || 5 : 5,
         recipe_type: formData.recipe_type,
         auto_calculate_cost: formData.auto_calculate_cost,
-        is_recipe_ingredient: formData.is_recipe_ingredient
+        is_recipe_ingredient: formData.is_recipe_ingredient,
+        tax_rate_id: formData.tax_rate_id || null,
       };
 
       const { data: _data, error } = await supabase
@@ -437,6 +467,7 @@ const Menu = () => {
         recipe_type: formData.recipe_type,
         auto_calculate_cost: formData.auto_calculate_cost,
         is_recipe_ingredient: formData.is_recipe_ingredient,
+        tax_rate_id: formData.tax_rate_id || null,
         updated_at: new Date().toISOString()
       };
 
@@ -575,7 +606,8 @@ const Menu = () => {
       low_stock_threshold: item.low_stock_threshold || 5,
       recipe_type: item.recipe_type || 'simple',
       auto_calculate_cost: item.auto_calculate_cost || false,
-      is_recipe_ingredient: item.is_recipe_ingredient || false
+      is_recipe_ingredient: item.is_recipe_ingredient || false,
+      tax_rate_id: item.tax_rate_id || '',
     });
     setIsEditModalOpen(true);
   };
@@ -742,6 +774,29 @@ const Menu = () => {
             placeholder="0.00"
             required
           />
+        </div>
+
+        <div>
+          <Label htmlFor="tax_rate_id">{taxLabel || 'Tax'} rate</Label>
+          <Select
+            value={formData.tax_rate_id || 'location-default'}
+            onValueChange={(value) => handleInputChange('tax_rate_id', value === 'location-default' ? '' : value)}
+          >
+            <SelectTrigger id="tax_rate_id">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="location-default">Location default</SelectItem>
+              {taxRates.map((rate) => (
+                <SelectItem key={rate.id} value={rate.id}>
+                  {rate.name} ({Number(rate.rate)}%{rate.is_inclusive === false ? ', added' : ', incl.'})
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Food and alcohol can sit on the same receipt. An empty choice uses the location default.
+          </p>
         </div>
 
         <div>

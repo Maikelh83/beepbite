@@ -29,6 +29,7 @@ import (
 
 	"github.com/beepbite/backend/internal/auth"
 	"github.com/beepbite/backend/internal/db"
+	"github.com/beepbite/backend/internal/linetax"
 	"github.com/beepbite/backend/internal/locations"
 	"github.com/beepbite/backend/internal/money"
 	"github.com/beepbite/backend/internal/tax"
@@ -151,6 +152,8 @@ func (h *Handler) modifyOrderItems(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrItemNotFound):
 		writeErr(w, http.StatusBadRequest, "one or more item_ids are invalid")
+	case errors.Is(err, linetax.ErrUnavailable):
+		writeErr(w, http.StatusUnprocessableEntity, "an item's tax rate is inactive or not on this location")
 	case errors.Is(err, ErrBadModifier):
 		writeErr(w, http.StatusBadRequest, err.Error())
 	case err != nil:
@@ -191,24 +194,21 @@ func (s *Store) ModifyOrderItems(
 	}
 
 	// --- 1. Lock the order and resolve location_id / organization_id ---
-	// The order's own tax_rate / tax_inclusive / currency_code are read under
-	// the same lock and REUSED below rather than re-resolved from the location.
+	// Currency stays the one snapshotted on the order. Re-resolving it from
+	// the location would relabel a sale the customer already saw.
 	//
-	// Editing an order must not restate it. If the operator changed their rate,
-	// switched from tax-inclusive to tax-exclusive, or moved currency between
-	// the sale and the edit, recomputing from today's settings would silently
-	// alter money that has in many cases already been taken. The snapshot on
-	// the row is what the customer agreed to.
+	// Tax is per line. A line that was already on the order keeps the rate
+	// snapshotted when it was first sent, so a menu edit during service does
+	// not restate it. A line that is new on this edit takes the item's rate
+	// now. The order-level rate cannot be reused: a mixed ticket does not
+	// have one.
 	var locationID, orgID string
-	var orderTaxRate float64
-	var orderTaxInclusive bool
 	var orderCurrency *string
 	err = tx.QueryRow(ctx,
-		`SELECT location_id, organization_id,
-		        CAST(tax_rate AS float8), tax_inclusive, currency_code
+		`SELECT location_id, organization_id, currency_code
 		   FROM orders WHERE id = $1 FOR UPDATE`,
 		orderID,
-	).Scan(&locationID, &orgID, &orderTaxRate, &orderTaxInclusive, &orderCurrency)
+	).Scan(&locationID, &orgID, &orderCurrency)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrOrderNotFound
 	}
@@ -322,23 +322,57 @@ func (s *Store) ModifyOrderItems(
 	}
 
 	// --- 6. Compute new order totals ---
+	// Read the rate already stored on each item before the lines are deleted.
+	// A line that stays keeps that snapshot. A line that is new resolves from
+	// the item. Rows written before per-line tax have a NULL rate and fall
+	// through to the item, which is the location default when the item has none.
 	var subtotalCents int64
 	for i, line := range lines {
 		subtotalCents += lineUnitCents[i] * int64(line.Quantity)
 	}
-
-	// Apply the order's own snapshotted tax posture. This handler previously
-	// applied the exclusive formula unconditionally, so editing a
-	// tax-inclusive order recomputed its total as if the price had never
-	// included tax — adding the full tax a second time.
-	orderTax := tax.Config{
-		Rate:      tax.RateFromPercent(orderTaxRate),
-		Inclusive: orderTaxInclusive,
+	kept := map[string]tax.Line{}
+	snapRows, err := tx.Query(ctx, `
+		SELECT DISTINCT ON (item_id)
+		       item_id::text, CAST(tax_rate AS float8), tax_inclusive, COALESCE(tax_label, '')
+		FROM order_items
+		WHERE order_id = $1 AND tax_rate IS NOT NULL
+		ORDER BY item_id, created_at
+	`, orderID)
+	if err != nil {
+		return nil, err
 	}
-	taxResult := orderTax.Compute(subtotalCents)
-	taxRate := orderTaxRate
-	taxCents := taxResult.Tax
-	totalCents := taxResult.Gross
+	for snapRows.Next() {
+		var itemID, label string
+		var percent float64
+		var inclusive bool
+		if err := snapRows.Scan(&itemID, &percent, &inclusive, &label); err != nil {
+			snapRows.Close()
+			return nil, err
+		}
+		kept[itemID] = tax.Line{Percent: percent, Inclusive: inclusive, Label: label}
+	}
+	snapRows.Close()
+	if err := snapRows.Err(); err != nil {
+		return nil, err
+	}
+
+	priced := make([]linetax.PricedLine, len(lines))
+	for i, line := range lines {
+		pl := linetax.PricedLine{
+			ItemID: line.ItemID,
+			Amount: lineUnitCents[i] * int64(line.Quantity),
+		}
+		if prev, ok := kept[line.ItemID]; ok {
+			pl.Override = &prev
+		}
+		priced[i] = pl
+	}
+	split, err := linetax.Price(ctx, tx, locationID, priced)
+	if err != nil {
+		return nil, fmt.Errorf("resolving tax configuration: %w", err)
+	}
+	taxCents := split.Tax
+	totalCents := split.Gross
 
 	// --- 7. Delete existing order_items (cascades to order_item_modifiers) ---
 	if _, err := tx.Exec(ctx,
@@ -350,13 +384,19 @@ func (s *Store) ModifyOrderItems(
 	// --- 8. Insert new order_items and order_item_modifiers ---
 	for i, line := range lines {
 		unitCents := lineUnitCents[i]
+		ln := split.Lines[i]
 		var orderItemID string
 		if err := tx.QueryRow(ctx, `
-			INSERT INTO order_items (order_id, item_id, quantity, unit_price_cents, total_price_cents, special_instructions, course_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			INSERT INTO order_items (
+				order_id, item_id, quantity, unit_price_cents, total_price_cents,
+				special_instructions, course_id,
+				tax_rate, tax_inclusive, tax_label, net_cents, tax_cents
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			RETURNING id
 		`, orderID, line.ItemID, line.Quantity, unitCents, unitCents*int64(line.Quantity),
 			nullStr(line.Notes), nullStr(line.CourseID),
+			ln.Percent, ln.Inclusive, ln.Label, ln.Net, ln.Tax,
 		).Scan(&orderItemID); err != nil {
 			return nil, err
 		}
@@ -373,14 +413,21 @@ func (s *Store) ModifyOrderItems(
 	}
 
 	// --- 9. Update order totals ---
+	if err := linetax.ReplaceLines(ctx, tx, orderID, split.Buckets); err != nil {
+		return nil, err
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE orders
 		SET subtotal_cents = $2,
 		    tax_cents      = $3,
 		    total_cents    = $4,
+		    tax_rate       = $5,
+		    tax_inclusive  = $6,
+		    tax_mixed      = $7,
 		    updated_at     = now()
 		WHERE id = $1
-	`, orderID, subtotalCents, taxCents, totalCents); err != nil {
+	`, orderID, subtotalCents, taxCents, totalCents,
+		split.HeaderRate, split.HeaderInclusive, split.Mixed); err != nil {
 		return nil, err
 	}
 
@@ -460,8 +507,8 @@ func (s *Store) ModifyOrderItems(
 		CurrencyCode:     cur.Code,
 		CurrencyDecimals: cur.Decimals,
 
-		TaxRate:      taxRate,
-		TaxInclusive: orderTaxInclusive,
+		TaxRate:      split.HeaderRate,
+		TaxInclusive: split.HeaderInclusive,
 
 		KDSTicketIDs: kdsTicketIDs,
 	}, nil

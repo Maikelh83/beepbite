@@ -68,9 +68,9 @@ npm run dev
 De upstream-README noemt ergens een kassier `cashier` met PIN `1234`. Dat is
 niet wat `seedcopper` aanmaakt.
 
-BTW in dit seed is **één tarief van 9%, prijzen inclusief**, label `BTW`.
-Dat is het lage tarief voor etenswaren, expres niet 21%. Alcohol en fris
-naast eten horen in Nederland niet onder één tarief; zie hieronder.
+BTW in dit seed is **inclusief**, label `BTW`. Het locatie-default is 9%.
+Eten, fris en koffie staan op een eigen tarief **BTW 9%**; wijn en cocktails
+op **BTW 21%**. Order `BTW0001` heeft beide op één bon. Zie Gemengde BTW.
 
 ## Wat in Nederland klopt
 
@@ -81,7 +81,7 @@ BeepBite heeft geen land ingebakken. Per locatie stel je in:
 | Valuta | `EUR` (2 decimalen). Bedragen in de database zijn centen. |
 | Tijdzone | `Europe/Amsterdam`. Ordernummers, kassadag en rapportgrenzen volgen die dag, niet UTC. Een bestelling om 00:30 hoort bij die kalenderdag. |
 | BTW-label | Vrij tekstveld. Zet `BTW`. |
-| Inclusief | `tax_inclusive = true`. De kaartprijs is de prijs. De bon toont welk deel BTW was. |
+| Inclusief | `tax_inclusive = true`. De kaartprijs is de prijs. De bon toont per tarief de grondslag en de BTW. |
 | Telefoon | Landcode `31`. |
 
 ESC/POS over het netwerk (TCP poort 9100) stuurt echt bytes, inclusief een
@@ -100,16 +100,12 @@ niet zelf aan.
 
 ## Wat ontbreekt voor snackbar + catering
 
-- **Twee BTW-tarieven per bon.** 9% (eten) en 21% (alcohol, en een deel van
-  de non-food) horen op één ticket door elkaar. Er is een tabel `tax_rates`
-  met de opmerking dat meerdere tarieven mogen, maar een order gebruikt alleen
-  de oudste actieve rij, of anders het ene tarief van de locatie. Artikelen
-  hebben geen eigen tarief. Een gemengde snackbar- of cateringbon klopt dus
-  niet voor de aangifte.
 - **Geen gecertificeerd kassasysteem.** Er is een fiscale bonnummer-reeks,
   geen koppeling met een Nederlandse fiscus, geen controle- of
-  afslagrapportage in de zin van de Belastingdienst. CashDesk niet uitzetten
-  op basis van deze proef.
+  afslagrapportage in de zin van de Belastingdienst, en geen traject voor het
+  Keurmerk Betrouwbare Afrekensystemen. CashDesk niet uitzetten op basis van
+  deze proef. De BTW-splitsing hieronder is een technische bon, geen aangifte
+  en geen keurmerk.
 - **ESC/POS en het euroteken / diakrieten**, hierboven.
 - **Kassadag versus een paar rapportviews.** `business_date` is lokaal.
   Sommige oudere views groeperen nog met `AT TIME ZONE 'UTC'`. Rond middernacht
@@ -144,6 +140,37 @@ niet zelf aan.
   WhatsApp-veld gezet.
 - **Sync tussen twee vestigingen** (snackbar en lunchkeuken) bestaat niet.
   Eén database, één proces.
+
+## Gemengde BTW
+
+Een artikel heeft een optioneel tarief (`items.tax_rate_id` → `tax_rates`).
+Leeg betekent het locatie-default: de oudste actieve rij in `tax_rates`,
+anders `locations.tax_rate`. Op de menukaart (Menu) kies je per artikel
+minstens 9% en 21%, label BTW. De Nederlandse seed zet eten, fris en koffie
+op **BTW 9%** en wijn plus cocktails op **BTW 21%**, en schrijft één proefbon
+`BTW0001` (Americano + Espresso Martini).
+
+Bij het aanslaan bewaart elke orderregel het tarief, of de prijs inclusief
+was, de grondslag en de BTW. Prijzen blijven inclusief waar de locatie
+`tax_inclusive` is: de klant betaalt de kaartprijs, de bon haalt de BTW eruit.
+Meerdere regels met hetzelfde tarief worden één keer afgerond (niet per
+regel, dat scheelt een cent). `orders.tax_cents` is de som. Delen de regels
+niet één tarief, dan is `orders.tax_mixed` waar en `orders.tax_rate` is 0 —
+dat is geen gemiddelde. De splitsing staat in `order_tax_lines` en, per
+kassadag, in de view `order_tax_by_rate`.
+
+De kassabon (scherm, PDF en ESC/POS) toont per tarief de grondslag en de
+BTW, plus het totaal. Het keukenscherm blijft een bereidingsbriefje; de
+bedragen staan op de regel, niet op het KDS. De webhook
+`POST /webhooks/vers-en-belegd/orders` gebruikt het tarief van de SKU. Een
+SKU zonder eigen tarief houdt het locatie-default. Het antwoord bevat
+`tax_lines`. Een herhaald extern id blijft dezelfde order (HTTP 200,
+`replayed: true`).
+
+Bezorgkosten en fooi zitten niet in de BTW-grondslag. Chat-orders en tabs
+rekenen nog met één tarief voor de hele order. De publieke menukaart schat
+de BTW nog met het locatietarief; het bedrag dat de server schrijft, volgt
+het artikel.
 
 ## Koppeling
 
@@ -304,8 +331,10 @@ newline.
 6. **Hosting.** Eén machine die jij beheert: Postgres, de Go-binary, backups
    (`pg_dump`). Kassa en KDS mogen op het LAN. Alleen de webhook heeft
    publieke HTTPS nodig (een klein VPS-adres of een tunnel die jij draait).
-   Er is geen BeepBite-cloud. Zet dit niet op de productie-kassa van
-   Boslaantje tot de BTW-mix en de fiscale vraag expliciet zijn beantwoord.
+   Er is geen BeepBite-cloud. De technische BTW-splitsing (9% en 21% op één
+   bon) staat in deze fork. Een keurmerk of een fiscale certificaat is dat
+   niet. Zet dit niet op de productie-kassa van Boslaantje tot die vraag
+   apart is beantwoord.
 7. **CashDesk** blijft de snackbarkassa tot je zelf anders besluit.
 
 ## Wat deze run heeft gedraaid
@@ -331,3 +360,8 @@ Twee gesigneerde POSTs tegen de draaiende server:
 2× Americano, notitie `proeforder Vers & Belegd`. De kassa op
 `/pos/workspace` toont EUR en een regel `BTW`. Logins zoals in de tabel
 hierboven (`demo@beepbite.app` / `Demo1234!`).
+
+Daarna is gemengde BTW toegevoegd. Een nieuwe `seedcopper` (zonder `--clean`
+is genoeg als het menu er al staat) schrijft `BTW0001`: Americano 9% en
+Espresso Martini 21% op één bon, prijzen inclusief. De kassa en de bon tonen
+beide grondslagen.

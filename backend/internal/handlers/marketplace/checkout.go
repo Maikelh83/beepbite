@@ -25,10 +25,10 @@ import (
 
 	"github.com/beepbite/backend/internal/bizday"
 	"github.com/beepbite/backend/internal/db"
+	"github.com/beepbite/backend/internal/linetax"
 	"github.com/beepbite/backend/internal/locations"
 	"github.com/beepbite/backend/internal/money"
 	"github.com/beepbite/backend/internal/payments"
-	"github.com/beepbite/backend/internal/tax"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -337,21 +337,26 @@ func (cs *CheckoutStore) CreateCheckoutOrder(
 			ErrInvalidTip, req.TipCents, maxTipMultiple, subtotalCents)
 	}
 
-	// Resolve the store's tax posture — rate AND inclusive/exclusive.
-	//
-	// This path previously applied the exclusive formula unconditionally while
-	// the orders row recorded tax_inclusive from the schema default (true), so
-	// a marketplace order in a VAT country was recorded as tax-inclusive and
-	// charged as tax-exclusive: the customer paid the VAT twice.
-	taxCfg, err := taxConfigFor(ctx, tx, locationID, settings)
+	// Per item, same rule as the till. An item with no named rate uses the
+	// oldest active tax_rates row, else the location columns. Reading that
+	// row on this transaction matters: tax_rates is FORCE RLS, and a lookup
+	// on an unscoped connection comes back empty and would charge the
+	// location column instead of the named rate.
+	priced := make([]linetax.PricedLine, len(req.Items))
+	for i, line := range req.Items {
+		priced[i] = linetax.PricedLine{
+			ItemID: line.ItemID,
+			Amount: unitPriceCentsByItem[line.ItemID] * int64(line.Quantity),
+		}
+	}
+	split, err := linetax.Price(ctx, tx, locationID, priced)
 	if err != nil {
 		return nil, fmt.Errorf("resolving tax configuration: %w", err)
 	}
-	taxed := taxCfg.Compute(subtotalCents)
-	taxRate := taxCfg.Rate.Percent()
-	taxInclusive := taxCfg.Inclusive
-	taxCents := taxed.Tax
-	totalCents := taxed.Gross
+	taxRate := split.HeaderRate
+	taxInclusive := split.HeaderInclusive
+	taxCents := split.Tax
+	totalCents := split.Gross
 
 	// --- 4b. Tip is added on top of the taxed total, never taxed itself —
 	// same convention as pos/store.go's Wave 24 auto-gratuity (a tip is a
@@ -399,11 +404,11 @@ func (cs *CheckoutStore) CreateCheckoutOrder(
 		INSERT INTO orders (
 		    organization_id, location_id, customer_id, order_number,
 		    order_type, fulfillment_type, status,
-		    subtotal_cents, tax_cents, total_cents, tax_rate, tax_inclusive,
+		    subtotal_cents, tax_cents, total_cents, tax_rate, tax_inclusive, tax_mixed,
 		    currency_code, delivery_address, estimated_prep_time,
 		    gratuity_cents, business_date
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 30, $15, $16::date)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 30, $16, $17::date)
 		RETURNING id
 	`,
 		orgID, locationID, nullableStr(req.CustomerID), orderNumber,
@@ -411,7 +416,7 @@ func (cs *CheckoutStore) CreateCheckoutOrder(
 		// tax_inclusive was a literal `false` here while the tax was computed
 		// exclusively — internally consistent, but it ignored the store's
 		// actual convention. It is now snapshotted from the configuration.
-		subtotalCents, taxCents, totalCents, taxRate, taxInclusive,
+		subtotalCents, taxCents, totalCents, taxRate, taxInclusive, split.Mixed,
 		nullableStr(cur.Code), dAddr,
 		// gratuity_cents: the same column pos/store.go's auto-gratuity writes
 		// (migration 001 baseline; no new column needed). total_cents above
@@ -426,14 +431,22 @@ func (cs *CheckoutStore) CreateCheckoutOrder(
 	// --- 7. Insert order items using bigint cents columns ---
 	// The consolidated schema uses unit_price_cents / total_price_cents (bigint),
 	// not the legacy float unit_price / total_price columns.
-	for _, line := range req.Items {
+	for i, line := range req.Items {
 		unitCents := unitPriceCentsByItem[line.ItemID]
+		ln := split.Lines[i]
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO order_items (order_id, item_id, quantity, unit_price_cents, total_price_cents, special_instructions)
-			VALUES ($1, $2, $3, $4, $5, $6)
-		`, orderID, line.ItemID, line.Quantity, unitCents, unitCents*int64(line.Quantity), nullableStr(line.Notes)); err != nil {
+			INSERT INTO order_items (
+				order_id, item_id, quantity, unit_price_cents, total_price_cents, special_instructions,
+				tax_rate, tax_inclusive, tax_label, net_cents, tax_cents
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`, orderID, line.ItemID, line.Quantity, unitCents, unitCents*int64(line.Quantity), nullableStr(line.Notes),
+			ln.Percent, ln.Inclusive, ln.Label, ln.Net, ln.Tax); err != nil {
 			return nil, err
 		}
+	}
+	if err := linetax.ReplaceLines(ctx, tx, orderID, split.Buckets); err != nil {
+		return nil, err
 	}
 
 	// --- 8. Online-gateway path only: start the charge and record a pending
@@ -510,74 +523,4 @@ func nullableStr(s string) interface{} {
 		return nil
 	}
 	return s
-}
-
-// taxConfigFor resolves the effective tax posture — rate, inclusive/exclusive
-// convention, and receipt label — for a location:
-//
-//  1. The first active row in tax_rates for the location, which carries its own
-//     rate and is_inclusive.
-//  2. The location's own tax settings, already resolved into `settings`.
-//
-// It returns BOTH the rate and the convention because a rate alone is not
-// enough to compute a total, and treating it as if it were is how the
-// exclusive-only formula ended up here in the first place.
-//
-// It takes the CALLER'S TRANSACTION, not the pool, and that is the whole point.
-// This used to run `pool.QueryRow` on a fresh pooled connection with none of the
-// app.* session variables set. tax_rates carries FORCE ROW LEVEL SECURITY and a
-// tenant SELECT policy keyed on current_org_id(), so the policy evaluated false
-// and the query returned pgx.ErrNoRows for a row that existed — which is
-// indistinguishable from "this location configured no named rate", so tier 1 was
-// skipped and tier 2 charged the location's own rate instead.
-//
-// That is the same defect as the bare pool.BeginTx in CreateCheckoutOrder's
-// store lookup, but with a far worse symptom: the store lookup answered "store
-// not found", which is obviously broken, whereas this answered with a real
-// -looking tax line for the wrong tax. An operator running a 25% excise
-// alongside a 15% VAT column was silently charged the VAT.
-//
-// tx is already scoped to the owning organization (db.Scope{OrgID: orgID},
-// applied above once the marketplace-visible store has been resolved), which is
-// exactly the scope tax_rates_select requires. Reading inside the caller's
-// transaction also means the rate comes from the same snapshot as the order row
-// it is written onto, rather than from a second connection that could observe a
-// mid-flight settings change.
-//
-// This is a local copy to avoid a cross-package dependency on the pos package.
-func taxConfigFor(ctx context.Context, tx pgx.Tx, locationID string, settings locations.Settings) (tax.Config, error) {
-	var (
-		rate      float64
-		inclusive bool
-		label     *string
-	)
-	err := tx.QueryRow(ctx, `
-		SELECT CAST(rate AS float8), is_inclusive, name
-		FROM tax_rates
-		WHERE location_id = $1
-		  AND is_active = true
-		ORDER BY created_at
-		LIMIT 1
-	`, locationID).Scan(&rate, &inclusive, &label)
-	if err == nil {
-		cfg := tax.Config{Rate: tax.RateFromPercent(rate), Inclusive: inclusive}
-		if label != nil {
-			cfg.Label = *label
-		}
-		return cfg, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return tax.Config{}, err
-	}
-
-	// Fall back to the location's own tax_rate / tax_inclusive / tax_label
-	// (migration 056). A zero rate here is a legitimate configuration —
-	// tax-exempt, or a jurisdiction with no sales tax — and charges nothing
-	// rather than inheriting some other country's rate.
-	//
-	// This tier is only trustworthy because `settings` can no longer be the
-	// neutral all-zero placeholder: locations.SettingsFor now returns
-	// locations.ErrLocationNotFound instead of inventing one, so reaching here
-	// means a real locations row really does say this.
-	return settings.Tax, nil
 }

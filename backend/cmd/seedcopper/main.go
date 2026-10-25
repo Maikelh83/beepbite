@@ -204,6 +204,7 @@ func main() {
 	}
 	steps := []step{
 		{"menu + KDS", seedMenu},
+		{"nl mixed tax", seedMixedTax},
 		{"floor plan", seedFloor},
 		{"customers/reservations/waitlist/reviews", seedFOH},
 		{"staff roster + shifts", seedStaff},

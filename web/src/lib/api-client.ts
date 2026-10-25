@@ -387,6 +387,7 @@ const FK: Record<string, Record<string, FKEdge>> = {
   items: {
     categories:      { table: 'categories',      kind: 'one',  col: 'category_id' },
     item_variations: { table: 'item_variations', kind: 'many', col: 'item_id' },
+    tax_rates:       { table: 'tax_rates',       kind: 'one',  col: 'tax_rate_id' },
   },
   item_variations: {
     item_variation_options: { table: 'item_variation_options', kind: 'many', col: 'variation_id' },

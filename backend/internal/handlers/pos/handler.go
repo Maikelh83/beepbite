@@ -11,6 +11,7 @@ import (
 
 	"github.com/beepbite/backend/internal/auth"
 	"github.com/beepbite/backend/internal/idempotency"
+	"github.com/beepbite/backend/internal/linetax"
 	"github.com/beepbite/backend/internal/payments"
 )
 
@@ -168,6 +169,9 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	case errors.Is(err, ErrItemNotFound):
 		writeErr(w, http.StatusBadRequest, "one or more item_ids are invalid")
+		return
+	case errors.Is(err, linetax.ErrUnavailable):
+		writeErr(w, http.StatusUnprocessableEntity, "an item's tax rate is inactive or not on this location")
 		return
 	case errors.Is(err, ErrBadVariation):
 		writeErr(w, http.StatusBadRequest, "one or more variation_option_ids are invalid")
