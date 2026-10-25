@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { parentSelectColumns } from '../lib/api-client';
 import { splitTax } from '../lib/tax-buckets';
 
 describe('splitTax', () => {
@@ -23,5 +24,17 @@ describe('splitTax', () => {
     expect(got.grossCents).toBe(14300);
     expect(got.buckets[0]).toMatchObject({ netCents: 2569, taxCents: 231, grossCents: 2800 });
     expect(got.buckets[1]).toMatchObject({ netCents: 9504, taxCents: 1996, grossCents: 11500 });
+  });
+});
+
+describe('parentSelectColumns', () => {
+  it('asks for the item tax-rate foreign key when the rate is embedded', () => {
+    const cols = parentSelectColumns('items', `
+      id, name, price, category_id,
+      categories ( id, name ),
+      tax_rates ( name, rate, is_inclusive )
+    `);
+    expect(cols.split(',')).toContain('tax_rate_id');
+    expect(cols.split(',')).toContain('category_id');
   });
 });

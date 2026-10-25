@@ -494,6 +494,25 @@ function findEdge(map: Record<string, FKEdge>, j: Join): FKEdge | null {
   return null;
 }
 
+// A one-embed is resolved from the FK stored on the parent. Callers often
+// select the relation (`tax_rates (name, rate)`) without naming that column.
+// Without it the follow-up lookup has no ids and every row embeds null.
+export function parentSelectColumns(table: string, select: string): string {
+  const parsed = parseSelect(select);
+  if (!parsed.joins.length || parsed.base === '*') return parsed.base;
+  const map = FK[table] || {};
+  const have = new Set(parsed.base.split(',').map((s) => s.trim()).filter(Boolean));
+  const extras: string[] = [];
+  for (const j of parsed.joins) {
+    const edge = findEdge(map, j);
+    if (edge && edge.kind === 'one' && !have.has(edge.col)) {
+      extras.push(edge.col);
+      have.add(edge.col);
+    }
+  }
+  return extras.length ? `${parsed.base},${extras.join(',')}` : parsed.base;
+}
+
 // Rows are opaque records keyed by column name — the shape varies by table
 // and is not modeled here (mirrors the untyped rows the old supabase-js
 // client returned).
@@ -689,7 +708,10 @@ class Builder {
         const parsed = parseSelect(this._cols);
         // Force multi-row fetch so we can resolve embeds, then unwrap to single.
         const wantSingle = this._single;
-        const qs = this._qs({ baseCols: parsed.base, single: wantSingle && !parsed.joins.length });
+        const qs = this._qs({
+          baseCols: parentSelectColumns(this._table, this._cols),
+          single: wantSingle && !parsed.joins.length,
+        });
         const res = await request<Row | Row[]>('GET', `${path}${qs}`);
         const { data, error } = res;
         if (error) {
