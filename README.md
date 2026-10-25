@@ -148,6 +148,22 @@ cd backend && go run ./cmd/seedcopper --env=local --clean   # full demo restaura
 `seedcopper` is also what generates every screenshot in this README — see
 `npm run screenshots` and [docs/screenshots.md](docs/screenshots.md).
 
+## Deze fork — Vers & Belegd
+
+Dit is de werkfork van Maikel Huijzer (Boslaantje Doen, Veenendaal) voor een
+**proef**, niet voor een live overstap. CashDesk blijft de snackbarkassa.
+BeepBite is pre-1.0.
+
+De bestelsite van Vers & Belegd post een geplaatste order naar
+`POST /webhooks/vers-en-belegd/orders`. Die landt als BeepBite-order
+(menu-prijs, BTW van de locatie, bezorg/afhaal, klant, idempotent op het
+order-id) en gaat de keuken-wachtrij in. Mollie wordt hier niet aangeroepen.
+Zonder `VERS_EN_BELEGD_WEBHOOK_SECRET` en `VERS_EN_BELEGD_LOCATION_SLUG`
+antwoordt dat pad 503 en draait de kassa gewoon door.
+
+Startstappen, demo-logins, wat er in Nederland wel en niet klopt, en het
+koppelcontract staan in [docs/vers-en-belegd.md](docs/vers-en-belegd.md).
+
 ## How it works
 
 ```mermaid
@@ -254,6 +270,7 @@ drift apart.
 | [User guide](docs/user-guide.md) | Running a service day to day, front to back |
 | [FAQ](docs/faq.md) | Cost, hosting, countries and currencies, hardware, support |
 | [Features](docs/features.md) | What each surface does, and what is deliberately not a feature |
+| [Vers & Belegd](docs/vers-en-belegd.md) | This fork: trial setup, NL fit, order intake from the lunch site |
 
 **Your data and obligations**
 

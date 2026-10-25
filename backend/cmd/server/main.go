@@ -81,6 +81,7 @@ import (
 	"github.com/beepbite/backend/internal/handlers/tracking"
 	"github.com/beepbite/backend/internal/handlers/twofa"
 	"github.com/beepbite/backend/internal/handlers/userprefs"
+	"github.com/beepbite/backend/internal/handlers/versenbelegd"
 	"github.com/beepbite/backend/internal/handlers/waittime"
 	"github.com/beepbite/backend/internal/handlers/wanumbers"
 	"github.com/beepbite/backend/internal/handlers/waste"
@@ -316,6 +317,11 @@ func main() {
 	waChannel := channelwhatsapp.New(wa)
 	chatSvc := chatbot.NewWithMapbox(database.Pool, waChannel, mbClient)
 	waWebhookH := whatsappwebhook.NewHandler(chatSvc, cfg.WhatsAppVerifyToken, cfg.WhatsAppAppSecret)
+	versBelegdH := versenbelegd.NewHandler(database.Pool, versenbelegd.Config{
+		WebhookSecret: cfg.VersEnBelegdWebhookSecret,
+		LocationSlug:  cfg.VersEnBelegdLocationSlug,
+		SKUMapPath:    cfg.VersEnBelegdSKUMapPath,
+	})
 
 	// Payments: BeepBite records tenders, it does not process cards. The
 	// PaymentProvider seam (internal/payments) has exactly one implementation,
@@ -363,6 +369,10 @@ func main() {
 
 	// Webhooks are unauthenticated — verified by HMAC or token per provider.
 	r.Mount("/webhooks/whatsapp", waWebhookH)
+	// Vers & Belegd posts a finished order. HMAC is the credential; the route
+	// answers 503 until VERS_EN_BELEGD_WEBHOOK_SECRET and
+	// VERS_EN_BELEGD_LOCATION_SLUG are both set.
+	versBelegdH.Mount(r)
 	// Public marketplace store directory (no auth required).
 	// RLS is enforced at the DB layer via MarketplaceScope (is_marketplace_visible=true only).
 	r.Route("/stores", func(r chi.Router) {

@@ -308,6 +308,13 @@ alongside the WhatsApp client, and hand it to whatever service needs to send thr
 service-layer code (`chatbot.Service`) is already written against the interface, not against
 WhatsApp specifically.
 
+A hosted checkout that posts one finished order is not a chat rail. Folding that JSON into
+`InboundMessage` would drop lines, fulfillment, the customer and the idempotency key. That shape
+is `channel.OrderSource` (`ParseOrder` → `InboundOrder`) in the same package. The first adapter is
+`internal/channel/versenbelegd`, wired as `POST /webhooks/vers-en-belegd/orders`. It is off until
+`VERS_EN_BELEGD_WEBHOOK_SECRET` and `VERS_EN_BELEGD_LOCATION_SLUG` are set. See
+[vers-en-belegd.md](vers-en-belegd.md).
+
 ## Migrations
 
 `backend/migrations/` holds exactly four files, numbered `NNN_name.sql`:

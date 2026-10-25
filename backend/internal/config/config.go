@@ -29,6 +29,13 @@ type Config struct {
 	WhatsAppAccessToken   string
 	WhatsAppPhoneNumberID string
 
+	// Vers & Belegd order intake. The route answers 503 until both the
+	// webhook secret and the location slug are set. The map file is
+	// optional: empty means the site sku is already items.sku.
+	VersEnBelegdWebhookSecret string
+	VersEnBelegdLocationSlug  string
+	VersEnBelegdSKUMapPath    string
+
 	MapboxToken  string
 	GeminiAPIKey string
 
@@ -136,27 +143,30 @@ func Load(env string) (*Config, error) {
 	}
 
 	c := &Config{
-		Env:                   env,
-		Port:                  envOr("PORT", "8080"),
-		DatabaseURL:           os.Getenv("DATABASE_URL"),
-		JWTSecret:             os.Getenv("JWT_SECRET"),
-		AccessTokenTTL:        envDuration("JWT_ACCESS_TTL", 15*time.Minute),
-		RefreshTokenTTL:       envDuration("JWT_REFRESH_TTL", 30*24*time.Hour),
-		CORSOrigins:           splitCSV(os.Getenv("CORS_ORIGINS")),
-		WhatsAppVerifyToken:   os.Getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN"),
-		WhatsAppAppSecret:     os.Getenv("WHATSAPP_APP_SECRET"),
-		WhatsAppAccessToken:   os.Getenv("WHATSAPP_ACCESS_TOKEN"),
-		WhatsAppPhoneNumberID: os.Getenv("WHATSAPP_PHONE_NUMBER_ID"),
-		MapboxToken:           os.Getenv("MAPBOX_TOKEN"),
-		GeminiAPIKey:          os.Getenv("GEMINI_API_KEY"),
-		MapboxCountry:         os.Getenv("MAPBOX_COUNTRY"),
-		MapboxProximity:       os.Getenv("MAPBOX_PROXIMITY"),
-		FXProvider:            os.Getenv("FX_PROVIDER"),
-		FXBaseURL:             os.Getenv("FX_OPENRATE_URL"),
-		FXCacheTTL:            envDuration("FX_CACHE_TTL", 5*time.Minute),
-		FXSources:             os.Getenv("FX_OPENRATE_SOURCES"),
-		FXMaxAge:              envDuration("FX_OPENRATE_MAX_AGE", time.Hour),
-		FXFetchTimeout:        envDuration("FX_OPENRATE_FETCH_TIMEOUT", 15*time.Second),
+		Env:                       env,
+		Port:                      envOr("PORT", "8080"),
+		DatabaseURL:               os.Getenv("DATABASE_URL"),
+		JWTSecret:                 os.Getenv("JWT_SECRET"),
+		AccessTokenTTL:            envDuration("JWT_ACCESS_TTL", 15*time.Minute),
+		RefreshTokenTTL:           envDuration("JWT_REFRESH_TTL", 30*24*time.Hour),
+		CORSOrigins:               splitCSV(os.Getenv("CORS_ORIGINS")),
+		WhatsAppVerifyToken:       os.Getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN"),
+		WhatsAppAppSecret:         os.Getenv("WHATSAPP_APP_SECRET"),
+		WhatsAppAccessToken:       os.Getenv("WHATSAPP_ACCESS_TOKEN"),
+		WhatsAppPhoneNumberID:     os.Getenv("WHATSAPP_PHONE_NUMBER_ID"),
+		VersEnBelegdWebhookSecret: os.Getenv("VERS_EN_BELEGD_WEBHOOK_SECRET"),
+		VersEnBelegdLocationSlug:  os.Getenv("VERS_EN_BELEGD_LOCATION_SLUG"),
+		VersEnBelegdSKUMapPath:    os.Getenv("VERS_EN_BELEGD_SKU_MAP"),
+		MapboxToken:               os.Getenv("MAPBOX_TOKEN"),
+		GeminiAPIKey:              os.Getenv("GEMINI_API_KEY"),
+		MapboxCountry:             os.Getenv("MAPBOX_COUNTRY"),
+		MapboxProximity:           os.Getenv("MAPBOX_PROXIMITY"),
+		FXProvider:                os.Getenv("FX_PROVIDER"),
+		FXBaseURL:                 os.Getenv("FX_OPENRATE_URL"),
+		FXCacheTTL:                envDuration("FX_CACHE_TTL", 5*time.Minute),
+		FXSources:                 os.Getenv("FX_OPENRATE_SOURCES"),
+		FXMaxAge:                  envDuration("FX_OPENRATE_MAX_AGE", time.Hour),
+		FXFetchTimeout:            envDuration("FX_OPENRATE_FETCH_TIMEOUT", 15*time.Second),
 	}
 
 	// Never leave AllowedOrigins empty: go-chi/cors turns an empty list into
@@ -165,7 +175,10 @@ func Load(env string) (*Config, error) {
 	// local dev frontends — a real deployment MUST set CORS_ORIGINS to its own
 	// origins.
 	if len(c.CORSOrigins) == 0 {
-		c.CORSOrigins = []string{"http://localhost:5173", "http://127.0.0.1:5173"}
+		c.CORSOrigins = []string{
+			"http://localhost:5173", "http://127.0.0.1:5173",
+			"http://localhost:5174", "http://127.0.0.1:5174",
+		}
 		log.Printf("CORS_ORIGINS is not set — defaulting to local dev origins %v; set CORS_ORIGINS explicitly for any shared or production deployment", c.CORSOrigins)
 	}
 

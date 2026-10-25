@@ -30,6 +30,12 @@
 //
 // That rule — the caller never branches on the rail, the adapter never drops
 // information silently — is the whole contract. Everything else is types.
+//
+// Chat rails implement Channel and, when they can receive, Inbound.
+// A hosted checkout that posts one finished order is not a chat rail:
+// folding its JSON into InboundMessage would drop lines, fulfillment,
+// the customer and the idempotency key. That shape is OrderSource, in
+// order.go. Vers & Belegd is the first one.
 package channel
 
 import "context"
