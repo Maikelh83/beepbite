@@ -152,10 +152,45 @@ func Render(r *receipts.Receipt, opts Opts) ([]byte, error) {
 		bold  bool
 	}{
 		{"Subtotal", r.SubtotalCents, false},
-		{"Tax", r.TaxCents, false},
-		{"Tip", r.TipCents, false},
-		{"TOTAL", r.TotalCents, true},
 	}
+	if len(r.TaxLines) == 0 {
+		totalRows = append(totalRows, struct {
+			label string
+			cents int64
+			bold  bool
+		}{"Tax", r.TaxCents, false})
+	} else {
+		for _, ln := range r.TaxLines {
+			label := ln.Label
+			if label == "" {
+				label = "Tax"
+			}
+			totalRows = append(totalRows,
+				struct {
+					label string
+					cents int64
+					bold  bool
+				}{label + " base", ln.NetCents, false},
+				struct {
+					label string
+					cents int64
+					bold  bool
+				}{label, ln.TaxCents, false},
+			)
+		}
+	}
+	totalRows = append(totalRows,
+		struct {
+			label string
+			cents int64
+			bold  bool
+		}{"Tip", r.TipCents, false},
+		struct {
+			label string
+			cents int64
+			bold  bool
+		}{"TOTAL", r.TotalCents, true},
+	)
 
 	labelW := contentW * 0.75
 	amtW := contentW * 0.25

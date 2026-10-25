@@ -91,9 +91,18 @@ type OrderSnapshot struct {
 	Items         []OrderItemSnapshot
 	SubtotalCents int64
 	TaxCents      int64
+	TaxLines      []TaxPrintLine
 	TipCents      int64
 	TotalCents    int64
 	CurrencyCode  string
+}
+
+// TaxPrintLine is one rate on a printed receipt.
+type TaxPrintLine struct {
+	Label    string
+	Rate     float64
+	NetCents int64
+	TaxCents int64
 }
 
 // OrderItemSnapshot is one line item for printing.
@@ -313,6 +322,29 @@ func (s *Store) GetOrderSnapshot(ctx context.Context, orderID string) (*OrderSna
 		if err != nil {
 			return err
 		}
+
+		taxRows, err := tx.Query(ctx, `
+			SELECT tax_label, CAST(tax_rate AS float8), net_cents, tax_cents
+			FROM order_tax_lines
+			WHERE order_id = $1
+			ORDER BY tax_rate, tax_label
+		`, orderID)
+		if err != nil {
+			return err
+		}
+		for taxRows.Next() {
+			var ln TaxPrintLine
+			if err := taxRows.Scan(&ln.Label, &ln.Rate, &ln.NetCents, &ln.TaxCents); err != nil {
+				taxRows.Close()
+				return err
+			}
+			snap.TaxLines = append(snap.TaxLines, ln)
+		}
+		if err := taxRows.Err(); err != nil {
+			taxRows.Close()
+			return err
+		}
+		taxRows.Close()
 
 		// Line items
 		rows, err := tx.Query(ctx, `

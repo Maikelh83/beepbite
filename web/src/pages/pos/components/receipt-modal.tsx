@@ -44,7 +44,7 @@ import {
 } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 import { formatMoney } from '@/lib/currency';
-import { fetchReceipt, type Receipt } from '@/services/receipts';
+import { fetchReceipt, receiptTaxRows, type Receipt } from '@/services/receipts';
 
 // ---------------------------------------------------------------------------
 // Helpers (shared with receipt-view.jsx style)
@@ -219,7 +219,9 @@ function ReceiptPaper({ receipt, printId }: ReceiptPaperProps) {
       {/* Financial summary */}
       <div className="mb-2 space-y-0.5">
         <Row label="Subtotal" value={fmt(receipt.subtotal_cents)} />
-        <Row label="Tax" value={fmt(receipt.tax_cents)} />
+        {receiptTaxRows(receipt).map((row) => (
+          <Row key={row.label} label={row.label} value={fmt(row.cents)} />
+        ))}
         {receipt.tip_cents > 0 && (
           <Row label="Tip / Gratuity" value={fmt(receipt.tip_cents)} />
         )}

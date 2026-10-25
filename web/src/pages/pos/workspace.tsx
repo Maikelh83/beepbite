@@ -98,6 +98,7 @@ interface MenuItem {
   daily_sold_count?: number | null;
   daily_counter_date?: string | null;
   categories?: { id: string; name: string } | null;
+  tax_rates?: { name?: string | null; rate?: number | string | null; is_inclusive?: boolean | null } | null;
 }
 
 // Mirrors backend/migrations/001_baseline.sql `categories` (subset selected below).
@@ -118,6 +119,9 @@ interface CartLineItem {
   modifier_names: string[];
   course_id?: string | null;
   notes?: string;
+  tax_rate?: number | null;
+  tax_inclusive?: boolean | null;
+  tax_label?: string | null;
 }
 
 interface WorkspaceSentOrderItem {
@@ -559,7 +563,8 @@ export default function PosWorkspacePage() {
           supabase.from('items').select(`
             id, name, description, price, category_id, is_86ed,
             daily_quantity, daily_sold_count, daily_counter_date,
-            categories ( id, name )
+            categories ( id, name ),
+            tax_rates ( name, rate, is_inclusive )
           `).eq('location_id', activeLocation.id).eq('is_active', true)
             .order('sort_order', { ascending: true }).order('name', { ascending: true }),
         ]);
@@ -793,6 +798,17 @@ export default function PosWorkspacePage() {
     linePriceCents?: number | null;
   } = {}) => {
     const basePrice = parseFloat(String(item.price || 0));
+    const namedRate = item.tax_rates;
+    const taxRate = namedRate && namedRate.rate != null && namedRate.rate !== ''
+      ? Number(namedRate.rate)
+      : null;
+    const taxFields = taxRate == null || Number.isNaN(taxRate)
+      ? {}
+      : {
+          tax_rate: taxRate,
+          tax_inclusive: namedRate?.is_inclusive ?? true,
+          tax_label: namedRate?.name || 'Tax',
+        };
     // Cart lines carry a major-unit price, so minor units are divided back by
     // the currency's scale — 100 would turn a ¥120 modifier into ¥1.20.
     const linePrice = linePriceCents != null ? linePriceCents / scale : basePrice + (extraCents / scale);
@@ -820,6 +836,7 @@ export default function PosWorkspacePage() {
             variation_option_ids: [],
             modifier_ids: selectedModifiers.map((m) => m.id),
             modifier_names: selectedModifiers.map((m) => m.name),
+            ...taxFields,
           },
         ],
       };
@@ -1475,6 +1492,11 @@ export default function PosWorkspacePage() {
                           <div className="flex items-end justify-between mt-2">
                             <span className="text-base font-bold text-foreground tabular-nums">
                               {format(Math.round(parseFloat(String(it.price || 0)) * scale))}
+                              {it.tax_rates?.rate != null && it.tax_rates.rate !== '' && (
+                                <span className="ml-1 text-[10px] font-semibold text-muted-foreground">
+                                  {Number(it.tax_rates.rate)}%
+                                </span>
+                              )}
                             </span>
                             {!isDisabled && (
                               <span

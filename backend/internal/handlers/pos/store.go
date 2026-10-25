@@ -10,9 +10,11 @@ import (
 
 	"github.com/beepbite/backend/internal/bizday"
 	"github.com/beepbite/backend/internal/db"
+	"github.com/beepbite/backend/internal/linetax"
 	"github.com/beepbite/backend/internal/locations"
 	"github.com/beepbite/backend/internal/money"
 	"github.com/beepbite/backend/internal/payments"
+	"github.com/beepbite/backend/internal/tax"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -163,12 +165,18 @@ type CreatedOrder struct {
 	// not assume 2.
 	CurrencyDecimals int `json:"currency_decimals"`
 
-	// TaxRate is the percentage applied, and TaxInclusive reports whether the
-	// line prices already contained it. Both are snapshotted onto the order.
-	TaxRate      float64 `json:"tax_rate"`
-	TaxInclusive bool    `json:"tax_inclusive"`
+	// TaxRate is the percentage applied when every line shares one rate, and
+	// TaxInclusive reports whether those prices already contained it. When
+	// TaxMixed is true the lines do not share a rate: TaxRate is 0 and is not
+	// a blended rate. TaxLines is the per-rate base and tax.
+	TaxRate      float64             `json:"tax_rate"`
+	TaxInclusive bool                `json:"tax_inclusive"`
+	TaxMixed     bool                `json:"tax_mixed"`
+	TaxLines     []tax.BreakdownLine `json:"tax_lines"`
 	// TaxLabel is what the receipt should call the tax ("VAT", "GST",
-	// "Sales Tax"). Never assume "VAT" — it does not exist in every country.
+	// "Sales Tax") when there is one rate. Never assume "VAT" — it does not
+	// exist in every country. A mixed order leaves this empty; each TaxLines
+	// row carries its own label.
 	TaxLabel string `json:"tax_label"`
 
 	KDSTicketIDs []string `json:"kds_ticket_ids"`
@@ -408,24 +416,30 @@ func (s *Store) CreateOrder(
 		subtotalCents += lineUnitCents[i] * int64(line.Quantity)
 	}
 
-	taxCfg, err := TaxConfigFor(ctx, s.pool, locationID)
+	// Each line is taxed at its item's rate. An item with no rate keeps the
+	// location default, so a menu that never set per-item rates still produces
+	// one rounding of the whole subtotal — the same figure this handler used
+	// to write. Delivery is not a line here; gratuity is added below and is
+	// not taxed.
+	priced := make([]linetax.PricedLine, len(lines))
+	for i, line := range lines {
+		priced[i] = linetax.PricedLine{
+			ItemID: line.ItemID,
+			Amount: lineUnitCents[i] * int64(line.Quantity),
+		}
+	}
+	split, err := linetax.Price(ctx, tx, locationID, priced)
 	if err != nil {
 		return nil, fmt.Errorf("resolving tax configuration: %w", err)
 	}
-	// Whether the subtotal already contains the tax is a property of the
-	// location, not of this code path. This handler previously applied the
-	// exclusive formula unconditionally while writing tax_inclusive=true (the
-	// old schema default) onto the row — so a South African order was recorded
-	// as VAT-inclusive and charged as if VAT-exclusive, overcharging the
-	// customer by the full tax on every POS sale.
-	//
-	// tax.Compute reads the location's convention and does the right one:
-	// inclusive extracts the tax from the subtotal, exclusive adds it on top.
-	taxResult := taxCfg.Compute(subtotalCents)
-	taxRate := taxCfg.Rate.Percent()
-	taxInclusive := taxCfg.Inclusive
-	taxCents := taxResult.Tax
-	totalCents := taxResult.Gross
+	taxRate := split.HeaderRate
+	taxInclusive := split.HeaderInclusive
+	taxCents := split.Tax
+	// Inclusive prices: Gross equals the menu subtotal. Exclusive prices:
+	// Gross is the subtotal plus tax. A cart that mixes the two conventions
+	// pays the sum of the line grosses, which is not either formula applied
+	// to the whole subtotal.
+	totalCents := split.Gross
 
 	// --- 4b. Auto-gratuity (Wave 24) ---
 	// If the location has auto_gratuity_enabled and the order's party_size meets
@@ -496,20 +510,19 @@ func (s *Store) CreateOrder(
 		INSERT INTO orders (
 		    organization_id, location_id, customer_id, order_number,
 		    order_type, fulfillment_type, status, table_session_id,
-		    subtotal_cents, tax_cents, total_cents, tax_rate, tax_inclusive,
+		    subtotal_cents, tax_cents, total_cents, tax_rate, tax_inclusive, tax_mixed,
 		    currency_code, estimated_prep_time, notes, gratuity_cents,
 		    business_date
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 20, $15, $16, $17::date)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 20, $16, $17, $18::date)
 		RETURNING id
 	`,
 		*orgID, locationID, nullStr(customerID), orderNumber,
 		orderType, fulfillmentTypeFor(orderType), initialStatus, nullStr(tableSessionID),
-		// tax_inclusive is snapshotted from the location's configuration rather
-		// than hardcoded (it was a literal `false` here). Snapshotting matters:
-		// if the operator later switches convention, this order must still
-		// reconcile against the money that was actually taken for it.
-		subtotalCents, taxCents, totalCents, taxRate, taxInclusive,
+		// tax_inclusive is the convention of the lines, not a hardcoded false.
+		// A later settings change must not restate what was charged. When the
+		// lines do not share a rate, tax_mixed is true and tax_rate is 0.
+		subtotalCents, taxCents, totalCents, taxRate, taxInclusive, split.Mixed,
 		cur.Code, notes, gratuityCents,
 		businessDate,
 	).Scan(&orderID); err != nil {
@@ -571,12 +584,18 @@ func (s *Store) CreateOrder(
 		}
 
 		var orderItemID string
+		ln := split.Lines[i]
 		if err := tx.QueryRow(ctx, `
-			INSERT INTO order_items (order_id, item_id, quantity, unit_price_cents, total_price_cents, special_instructions, course_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			INSERT INTO order_items (
+				order_id, item_id, quantity, unit_price_cents, total_price_cents,
+				special_instructions, course_id,
+				tax_rate, tax_inclusive, tax_label, net_cents, tax_cents
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			RETURNING id
 		`, orderID, line.ItemID, line.Quantity, unitCents, unitCents*int64(line.Quantity),
 			nullStr(line.Notes), nullStr(line.CourseID),
+			ln.Percent, ln.Inclusive, ln.Label, ln.Net, ln.Tax,
 		).Scan(&orderItemID); err != nil {
 			return nil, err
 		}
@@ -593,6 +612,10 @@ func (s *Store) CreateOrder(
 				return nil, err
 			}
 		}
+	}
+
+	if err := linetax.ReplaceLines(ctx, tx, orderID, split.Buckets); err != nil {
+		return nil, err
 	}
 
 	// --- 10. KDS fanout inside the same transaction ---
@@ -648,7 +671,9 @@ func (s *Store) CreateOrder(
 
 		TaxRate:      taxRate,
 		TaxInclusive: taxInclusive,
-		TaxLabel:     taxCfg.EffectiveLabel(),
+		TaxMixed:     split.Mixed,
+		TaxLines:     split.Buckets,
+		TaxLabel:     split.HeaderLabel,
 
 		KDSTicketIDs:  kdsTicketIDs,
 		Status:        initialStatus,

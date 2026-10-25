@@ -40,7 +40,8 @@ import {
 
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
-import { useMoney } from '@/context/locale-context';
+import { useLocale, useMoney } from '@/context/locale-context';
+import { splitTax } from '@/lib/tax-buckets';
 import { hasCapability } from '@/services/pos';
 import AdjustmentMenu from './adjustment-menu';
 import CourseSelect, { type Course } from './course-select';
@@ -94,6 +95,10 @@ export interface NewTicketItem {
   qty: number;
   course_id?: string | null;
   modifier_names?: string[];
+  /** Percent. Absent means the location default. */
+  tax_rate?: number | null;
+  tax_inclusive?: boolean | null;
+  tax_label?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -460,11 +465,17 @@ function NewSection({ newItems, onBumpQty, onRemove, courses, onSetCourse }: New
 // Footer — totals + Send + Charge
 // ---------------------------------------------------------------------------
 
+interface TicketTaxRow {
+  label: string;
+  cents: number;
+}
+
 interface TicketFooterProps {
   ticket: TicketLike | null;
   newSubtotalCents: number;
   sentSubtotalCents: number;
   totalCents: number;
+  taxRows: TicketTaxRow[];
   onSend?: () => void;
   onCharge?: () => void;
   sending?: boolean;
@@ -477,6 +488,7 @@ function TicketFooter({
   newSubtotalCents,
   sentSubtotalCents,
   totalCents,
+  taxRows,
   onSend,
   onCharge,
   sending,
@@ -504,6 +516,12 @@ function TicketFooter({
               <span className="tabular-nums">{format(newSubtotalCents)}</span>
             </div>
           )}
+          {taxRows.map((row) => (
+            <div key={row.label} className="flex justify-between text-gray-500 dark:text-gray-400">
+              <span>{row.label}</span>
+              <span className="tabular-nums">{format(row.cents)}</span>
+            </div>
+          ))}
         </div>
       )}
 
@@ -603,11 +621,26 @@ export default function ActiveTicketPanel({
   onSetCourse,           // optional (clientLineId, courseId | null) => void
 }: ActiveTicketPanelProps) {
   const { scale } = useMoney();
+  const { taxRate, taxInclusive, taxLabel } = useLocale();
 
   const newSubtotalCents = newItems.reduce(
     (sum, it) => sum + Math.round((parseFloat(String(it.price ?? 0)) * (it.qty || 0)) * scale),
     0,
   );
+  const taxSplit = splitTax(newItems.map((it) => ({
+    amountCents: Math.round((parseFloat(String(it.price ?? 0)) * (it.qty || 0)) * scale),
+    ratePercent: it.tax_rate ?? taxRate,
+    inclusive: it.tax_inclusive ?? taxInclusive,
+    label: it.tax_label || taxLabel || 'Tax',
+  })));
+  const taxRows = taxSplit.buckets.flatMap((bucket) => {
+    const rate = Number.isInteger(bucket.rate) ? String(bucket.rate) : String(bucket.rate);
+    const titled = bucket.label.includes('%') ? bucket.label : `${bucket.label} ${rate}%`;
+    return [
+      { label: `${titled} base`, cents: bucket.netCents },
+      { label: bucket.inclusive ? `${titled} (incl.)` : titled, cents: bucket.taxCents },
+    ];
+  });
   const sentSubtotalCents = sentOrders.reduce((orderSum, order) => {
     if (typeof order.total_cents === 'number') return orderSum + order.total_cents;
     const items = Array.isArray(order.items) ? order.items : [];
@@ -616,7 +649,10 @@ export default function ActiveTicketPanel({
       return lineSum + Math.round((parseFloat(String(it.unit_price ?? 0)) * (it.quantity || 0)) * scale);
     }, 0);
   }, 0);
-  const totalCents = newSubtotalCents + sentSubtotalCents;
+  // Inclusive prices: the menu sum is already the gross. Exclusive prices:
+  // the tax is added. A mixed cart pays the sum of the line grosses.
+  const newGrossCents = newItems.length === 0 ? 0 : taxSplit.grossCents;
+  const totalCents = newGrossCents + sentSubtotalCents;
 
   const hasUnpaidOrders = sentOrders.some((o) => o.payment_status !== 'paid');
 
@@ -653,6 +689,7 @@ export default function ActiveTicketPanel({
         newSubtotalCents={newSubtotalCents}
         sentSubtotalCents={sentSubtotalCents}
         totalCents={totalCents}
+        taxRows={taxRows}
         onSend={onSend}
         onCharge={onCharge}
         sending={sending}

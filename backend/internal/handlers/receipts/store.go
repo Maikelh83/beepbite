@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/beepbite/backend/internal/db"
+	"github.com/beepbite/backend/internal/tax"
 )
 
 // ErrOrderNotFound is returned when the order does not exist (or is not
@@ -64,11 +65,12 @@ type Receipt struct {
 	LineItems []LineItem `json:"line_items"`
 
 	// Financial summary (cents)
-	SubtotalCents int64  `json:"subtotal_cents"`
-	TaxCents      int64  `json:"tax_cents"`
-	TipCents      int64  `json:"tip_cents"`
-	TotalCents    int64  `json:"total_cents"`
-	CurrencyCode  string `json:"currency_code"`
+	SubtotalCents int64               `json:"subtotal_cents"`
+	TaxCents      int64               `json:"tax_cents"`
+	TaxLines      []tax.BreakdownLine `json:"tax_lines"`
+	TipCents      int64               `json:"tip_cents"`
+	TotalCents    int64               `json:"total_cents"`
+	CurrencyCode  string              `json:"currency_code"`
 
 	// Payments
 	Payments []PaymentLine `json:"payments"`
@@ -113,6 +115,9 @@ func (s *Store) GetReceipt(ctx context.Context, orderID string) (*Receipt, error
 	err := db.Scoped(ctx, s.pool, db.ScopeFromContext(ctx), func(tx pgx.Tx) error {
 		// ---- 1. Order header + location info --------------------------------
 		var storeAddress *string
+		var headerRate float64
+		var headerInclusive bool
+		var locationLabel string
 		err := tx.QueryRow(ctx, `
 			SELECT
 				o.id,
@@ -121,6 +126,8 @@ func (s *Store) GetReceipt(ctx context.Context, orderID string) (*Receipt, error
 				o.subtotal_cents,
 				o.tax_cents,
 				o.total_cents,
+				CAST(o.tax_rate AS float8),
+				o.tax_inclusive,
 				-- A receipt is the customer's legal record of what they paid. If
 				-- the order has no currency_code, stamping 'ZAR' on it is a false
 				-- statement about the transaction for every non-ZA operator. ''
@@ -128,7 +135,8 @@ func (s *Store) GetReceipt(ctx context.Context, orderID string) (*Receipt, error
 				COALESCE(o.currency_code, ''),
 				o.fiscal_receipt_number,
 				l.name,
-				l.address
+				l.address,
+				COALESCE(l.tax_label, '')
 			FROM orders o
 			JOIN locations l ON l.id = o.location_id
 			WHERE o.id = $1
@@ -139,10 +147,13 @@ func (s *Store) GetReceipt(ctx context.Context, orderID string) (*Receipt, error
 			&r.SubtotalCents,
 			&r.TaxCents,
 			&r.TotalCents,
+			&headerRate,
+			&headerInclusive,
 			&r.CurrencyCode,
 			&r.FiscalReceiptNumber,
 			&r.StoreName,
 			&storeAddress,
+			&locationLabel,
 		)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -151,6 +162,54 @@ func (s *Store) GetReceipt(ctx context.Context, orderID string) (*Receipt, error
 			return err
 		}
 		r.StoreAddress = storeAddress
+		r.TaxLines = []tax.BreakdownLine{}
+		taxRows, err := tx.Query(ctx, `
+			SELECT tax_label, CAST(tax_rate AS float8), tax_inclusive,
+			       net_cents, tax_cents, gross_cents
+			FROM order_tax_lines
+			WHERE order_id = $1
+			ORDER BY tax_rate, tax_label
+		`, orderID)
+		if err != nil {
+			return err
+		}
+		for taxRows.Next() {
+			var ln tax.BreakdownLine
+			if err := taxRows.Scan(&ln.Label, &ln.Rate, &ln.Inclusive, &ln.NetCents, &ln.TaxCents, &ln.GrossCents); err != nil {
+				taxRows.Close()
+				return err
+			}
+			r.TaxLines = append(r.TaxLines, ln)
+		}
+		if err := taxRows.Err(); err != nil {
+			taxRows.Close()
+			return err
+		}
+		taxRows.Close()
+		// Orders written before per-line snapshots have no rows. One line from
+		// the header keeps the old receipt shape. The label is the location's
+		// current label, which those rows did not snapshot.
+		if len(r.TaxLines) == 0 {
+			label := locationLabel
+			if label == "" {
+				label = tax.DefaultLabel
+			}
+			net := r.SubtotalCents
+			gross := r.SubtotalCents
+			if headerInclusive {
+				net = r.SubtotalCents - r.TaxCents
+			} else {
+				gross = r.SubtotalCents + r.TaxCents
+			}
+			r.TaxLines = []tax.BreakdownLine{{
+				Label:      label,
+				Rate:       headerRate,
+				Inclusive:  headerInclusive,
+				NetCents:   net,
+				TaxCents:   r.TaxCents,
+				GrossCents: gross,
+			}}
+		}
 
 		// ---- 2. Line items --------------------------------------------------
 		rows, err := tx.Query(ctx, `

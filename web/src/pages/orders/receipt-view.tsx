@@ -12,7 +12,7 @@ import { useEffect, useState } from 'react';
 import { Printer, Loader2, AlertCircle } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
-import { fetchReceipt, type Receipt } from '@/services/receipts';
+import { fetchReceipt, receiptTaxRows, type Receipt } from '@/services/receipts';
 import { formatPrice } from '@/lib/currency';
 import { useLocale } from '@/context/locale-context';
 
@@ -259,7 +259,9 @@ export default function ReceiptView({ orderId, onClose }: { orderId: string; onC
         {/* Financial summary */}
         <div className="mb-2 space-y-0.5">
           <Row label="Subtotal" value={fmt(receipt.subtotal_cents)} />
-          <Row label="Tax" value={fmt(receipt.tax_cents)} />
+          {receiptTaxRows(receipt).map((row) => (
+            <Row key={row.label} label={row.label} value={fmt(row.cents)} />
+          ))}
           {receipt.tip_cents > 0 && (
             <Row label="Tip / Gratuity" value={fmt(receipt.tip_cents)} />
           )}

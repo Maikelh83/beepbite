@@ -501,8 +501,19 @@ func buildReceiptTicket(s *OrderSnapshot, set locations.Settings) []byte {
 	}
 
 	b.Divider().
-		Text(fmt.Sprintf("%-24s        %s\n", "Subtotal", amount(s.SubtotalCents))).
-		Text(fmt.Sprintf("%-24s        %s\n", set.Tax.EffectiveLabel(), amount(s.TaxCents)))
+		Text(fmt.Sprintf("%-24s        %s\n", "Subtotal", amount(s.SubtotalCents)))
+	if len(s.TaxLines) == 0 {
+		b.Text(fmt.Sprintf("%-24s        %s\n", set.Tax.EffectiveLabel(), amount(s.TaxCents)))
+	} else {
+		for _, ln := range s.TaxLines {
+			label := ln.Label
+			if label == "" {
+				label = set.Tax.EffectiveLabel()
+			}
+			b.Text(fmt.Sprintf("%-24s        %s\n", truncate(label+" base", 24), amount(ln.NetCents)))
+			b.Text(fmt.Sprintf("%-24s        %s\n", truncate(label, 24), amount(ln.TaxCents)))
+		}
+	}
 
 	if s.TipCents > 0 {
 		b.Text(fmt.Sprintf("%-24s        %s\n", "Tip", amount(s.TipCents)))

@@ -387,6 +387,7 @@ const FK: Record<string, Record<string, FKEdge>> = {
   items: {
     categories:      { table: 'categories',      kind: 'one',  col: 'category_id' },
     item_variations: { table: 'item_variations', kind: 'many', col: 'item_id' },
+    tax_rates:       { table: 'tax_rates',       kind: 'one',  col: 'tax_rate_id' },
   },
   item_variations: {
     item_variation_options: { table: 'item_variation_options', kind: 'many', col: 'variation_id' },
@@ -493,6 +494,35 @@ function findEdge(map: Record<string, FKEdge>, j: Join): FKEdge | null {
   return null;
 }
 
+// A one-embed is resolved from the FK stored on the parent. Callers often
+// select the relation (`tax_rates (name, rate)`) without naming that column.
+// Without it the follow-up lookup has no ids and every row embeds null.
+export function parentSelectColumns(table: string, select: string): string {
+  const parsed = parseSelect(select);
+  if (!parsed.joins.length || parsed.base === '*') return parsed.base;
+  const map = FK[table] || {};
+  const have = new Set(parsed.base.split(',').map((s) => s.trim()).filter(Boolean));
+  const extras: string[] = [];
+  for (const j of parsed.joins) {
+    const edge = findEdge(map, j);
+    if (edge && edge.kind === 'one' && !have.has(edge.col)) {
+      extras.push(edge.col);
+      have.add(edge.col);
+    }
+  }
+  return extras.length ? `${parsed.base},${extras.join(',')}` : parsed.base;
+}
+
+// The follow-up query has to return the column the embed is joined on.
+// A one-embed joins child.id; a many-embed groups on the child's FK.
+// Callers list display columns (`name, rate`) and omit that key.
+export function embedSelectColumns(cols: string, required: string): string {
+  if (!cols || cols === '*') return cols || '*';
+  const have = new Set(cols.split(',').map((s) => s.trim()).filter(Boolean));
+  if (have.has(required)) return cols;
+  return `${cols},${required}`;
+}
+
 // Rows are opaque records keyed by column name — the shape varies by table
 // and is not modeled here (mirrors the untyped rows the old supabase-js
 // client returned).
@@ -512,7 +542,8 @@ async function resolveEmbeds(parentTable: string, rows: Row[], joins: Join[]): P
       if (!ids.length) { for (const r of rows) r[j.name] = null; continue; }
       const qs = new URLSearchParams();
       qs.append('in', ['id', ...ids].join(','));
-      if (j.cols && j.cols !== '*') qs.set('select', j.cols);
+      const select = embedSelectColumns(j.cols, 'id');
+      if (select && select !== '*') qs.set('select', select);
       const res = await request<Row[]>('GET', `/data/${edge.table}?${qs.toString()}`);
       const byId = new Map((res.data || []).map(r => [r.id, r]));
       for (const r of rows) r[j.name] = byId.get(r[edge.col]) || null;
@@ -521,7 +552,8 @@ async function resolveEmbeds(parentTable: string, rows: Row[], joins: Join[]): P
       if (!ids.length) { for (const r of rows) r[j.name] = []; continue; }
       const qs = new URLSearchParams();
       qs.append('in', [edge.col, ...ids].join(','));
-      if (j.cols && j.cols !== '*') qs.set('select', j.cols);
+      const select = embedSelectColumns(j.cols, edge.col);
+      if (select && select !== '*') qs.set('select', select);
       const res = await request<Row[]>('GET', `/data/${edge.table}?${qs.toString()}`);
       const grouped = new Map<unknown, Row[]>();
       for (const child of res.data || []) {
@@ -688,7 +720,10 @@ class Builder {
         const parsed = parseSelect(this._cols);
         // Force multi-row fetch so we can resolve embeds, then unwrap to single.
         const wantSingle = this._single;
-        const qs = this._qs({ baseCols: parsed.base, single: wantSingle && !parsed.joins.length });
+        const qs = this._qs({
+          baseCols: parentSelectColumns(this._table, this._cols),
+          single: wantSingle && !parsed.joins.length,
+        });
         const res = await request<Row | Row[]>('GET', `${path}${qs}`);
         const { data, error } = res;
         if (error) {
